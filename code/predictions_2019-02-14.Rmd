@@ -1,0 +1,453 @@
+---
+title: "Data Analysis 3 - Assignment 3"
+author: "Szabolcs Kerekes"
+date: "14/02/2019"
+output:
+  word_document: default
+  html_document: default
+---
+
+In the following we will create predictive models for the swimming pool ticket sales in Albuquerque, New Mexico. More accurately, we decided to focus on "ADMISTIER1", "ADMISTIER1" and "ATTENDANCE", type tickets for adults, in all of the swimming pools. Given that we see no trend in the data, only seasonality we don't difference but uses sales levels as the target variable in the models (and using dummies for controlling for seasonality). First we look at basic linear models, than we move to more advanced decision tree based models.
+
+### Part A) - summary
+In the first part we compared several models (including basic and ARIMA models), and came to the conclusion that the based on the mean RMSE values from the cross-validated tests the basic model with only dummy variables (for mainly months, weekends and holidays) proved to be the best, with an RMSE of **106.82**. Surprisignly, the best ARIMA model was a (0,0,1) model with somewhat inferior RMSE at **108.01**, while the best model including an autoregressive element was a (1,0,0) model with an RMSE of **115.72**. Based on these values we choose the basic model as the best model for forecasting. 
+
+On the below chart we visualised the best basic model and the (0,0,1) ARIMA model. It can be seen that the models forecast closely the same values, which is as expected given that the only difference is a moving average element in the ARIMA model.
+
+![](~/Documents/CEU/github/swimming_pools/outputs/60_days_forecast_basic.png)
+
+### Part B) - summary
+In addition to the models run in the first part, we also made a CART and a random forest model, including all dummy variables, as well as the sales one day, seven days and thirty days before. Not surprisingly, both of them fit the test data better than the previous models, with an RMSE of 69.22 for CART and 62.35 for random forest.
+
+We also visualised the 60 days forecasts for these models as well, compared to the previous two models, on the below chart. One takeaway here is that the CART model does not seem to be very successful in forecasting any variance over multiple days, which is a result of the decision tree, which in case of low values in the earlier days leads to the algorythm assigning the same value later-on into perpetutityn (as it can be seen in the details later, the decision tree on this path only includes sales data as predictor, which leads to the constant value regardless of the day or month). In-turn, the random forest model seems to provide forecasts with more variance, although compared to the basic and the ARIMA model we can see that the autoregressive element (which is demonstrated by the variance importance plot later in the analysis) results in close to flat sales in December. 
+
+![](~/Documents/CEU/github/swimming_pools/outputs/60_days_forecast_extended.png)
+
+## Part A) - basic models
+### Setting up the environment
+We start our work with setting up the environment and loading the packages used by the preparation and the modelling stages.
+
+```{r setup, results="hide", message=F, warning = F}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(zoo)
+library(dynlm)
+library(forecast)
+library(astsa) ## for ACF/PACF plots
+library(caret)
+library(rattle) ## for plots
+```
+
+### Cleaning the data
+We continue with cleaning and preparing the data for model building. The main steps to highlight is that we limit the sales to "ADMISTIER1", "ADMISTIER1" and "ATTENDANCE" type tickets for adults, on a daily basis. We control for missing values via imputing data. We create new variables based on dates, as well as based on external information (holiday dates), and also on previous sales. Eventually we decide not to transform the target variable into difference from level, as the data does not show any trends in it.
+
+```{r data cleaning, results="hide"}
+pools_backup <- read.table('~/Documents/CEU/DA3/assig_3/SwimmingPoolAdmissionsCABQ-en-us.csv', 
+                           sep = "\t", header = T, fileEncoding = 'UCS-2LE')
+
+pools <- pools_backup
+glimpse(pools)
+
+### We start with transforming dates into proper date-time format.
+pools <- pools %>% mutate(Date_Time = ymd_hms(Date_Time))
+
+### Next we check the reporting group, as it is only one group, we exclude this variable.
+unique(pools$Reporting.Group)
+pools <- pools %>% select(-Reporting.Group)
+
+### Then we look at the locations, but as sales are fairly spread out between all locations, we decide to keep all of them in the dataset.
+unique(pools$Location)
+pools %>% group_by(Location) %>% summarize(count = n(), perc = count / nrow(pools) * 100) %>% arrange(-count)
+
+### Three categories dominate the sales, so we will keep only those, also the other categories seems to be related to special instances or discounts.
+unique(pools$Category)
+cats <- pools %>% group_by(Category) %>% summarize(count = n(), perc = count / nrow(pools) * 100) %>% arrange(-count)
+cats
+cats <- c("ADMISTIER2", "ATTENDANCE", "ADMISTIER1")
+
+pools <- pools %>% filter(Category %in% cats)
+
+### We keep only adult tickets, to make our model more specific.
+unique(pools$ITEM)
+items <- pools %>% group_by(ITEM) %>% summarize(count = n(), perc = count / nrow(pools) * 100) %>% arrange(-count)
+items
+
+pools <- pools %>% filter(ITEM == "ADULT     ")
+
+### There are some observations with negative sales, which we will take out.
+summary(pools$QUANTITY)
+
+pools <- pools %>% filter(QUANTITY >= 0)
+
+pools <- pools %>% mutate(date = date(Date_Time)) %>% group_by(date) %>% summarise(sales = sum(QUANTITY))
+
+### We will create 0 value observations for the dates which are missing, than we will adjust this based on the holiday dummies, assuming that only on holidays was sales truly zero, otherwise we will impute means. We also add forecast dates for the outer 60 days forecast period.
+summary(pools$sales)
+max(pools$date) - min(pools$date)
+all_dates <- seq(min(pools$date), max(pools$date), by = 1)
+
+original_max <- max(pools$date)
+
+forecast_dates <- seq(max(pools$date) + 1, max(pools$date) + 60, 1)
+
+forecast_dates <- data.frame('date' = forecast_dates, 'sales' = rep(0, 60))
+
+pools <- rbind(pools, forecast_dates)
+
+missings <- NULL
+
+for (dates in 1:length(all_dates)){
+  if (all_dates[dates] %in% pools$date == 0){
+    item <- all_dates[dates]
+    missings <- c(missings, item)
+  }
+}
+
+missings <- as.data.frame(as.Date.numeric(missings))
+missings$sales <- 0
+colnames(missings) <- c("date", "sales")
+
+pools <- rbind(pools, missings)
+
+### Finally we arrange the dataset by dates and create dummy variables based on dates.
+pools <- pools %>% arrange(date)
+
+pools <- pools %>% mutate(day = as.factor(day(date)), 
+                          week = as.factor(week(date)), 
+                          month = as.factor(month(date)), 
+                          year = as.factor(year(date)),
+                          sales_flag = ifelse(sales == 0, 1, 0)) # we mark with this where we imputed data
+
+### As a next step we create holiday dummies based on https://www.officeholidays.com/index.php
+hd_2009 <- c("01-01", "01-19", "02-16", "05-25", "07-03", "09-07", "10-12", "11-11", "11-26", "11-27", "12-25")
+hd_2009 <- as.Date(paste0("2009-", hd_2009))
+
+hd_2010 <- c("01-01", "01-18", "02-15", "05-31", "07-05", "09-06", "10-11", "11-11", "11-25", "11-26", "12-24", "12-31")
+hd_2010 <- as.Date(paste0("2010-", hd_2010))
+
+hd_2011 <- c("01-17", "02-21", "05-30", "07-04", "09-05", "10-10", "11-11", "11-24", "11-25", "12-26")
+hd_2011 <- as.Date(paste0("2011-", hd_2011))
+
+hd_2012 <- c("01-02", "01-16", "02-20", "05-28", "07-04", "09-03", "10-08", "11-12", "11-22", "11-23", "12-25")
+hd_2012 <- as.Date(paste0("2012-", hd_2012))
+
+hd_2013 <- c("01-01", "01-21", "02-18", "05-27", "07-04", "09-02", "10-14", "11-11", "11-28", "12-25")
+hd_2013 <- as.Date(paste0("2013-", hd_2013))
+
+hd_2014 <- c("01-01", "01-20", "02-17", "05-26", "07-04", "09-01", "10-13", "11-11", "11-27", "12-25")
+hd_2014 <- as.Date(paste0("2014-", hd_2014))
+
+hd_2015 <- c("01-01", "01-19", "02-16", "05-25", "07-03", "09-07", "10-12", "11-11", "11-26", "11-27", "12-25")
+hd_2015 <- as.Date(paste0("2015-", hd_2015))
+
+hd_2016 <- c("01-01", "01-18", "05-30", "07-04", "09-05", "10-10", "11-11", "11-24", "11-25", "12-26")
+hd_2016 <- as.Date(paste0("2016-", hd_2016))
+
+hd_2017 <- c("01-02", "01-16", "05-29", "07-04", "09-04", "10-09", "11-10", "11-23", "11-24", "12-25")
+hd_2017 <- as.Date(paste0("2017-", hd_2017))
+
+hd_2018<- c("01-01", "01-15")
+hd_2018 <- as.Date(paste0("2018-", hd_2018))
+
+holidays <- c(hd_2009, hd_2010, hd_2011, hd_2012, hd_2013, hd_2014, hd_2015, hd_2016, hd_2017, hd_2018)
+
+pools$holiday <- ifelse(pools$date %in% holidays, 1, 0)
+
+pools$sales_flag <- ifelse(pools$date > original_max, 0, pools$sales_flag)
+
+### We impute mean sales values for those days where we have 0 sales and it is not a holiday.
+for (days in 1:nrow(pools)){
+  if ((pools$sales_flag[days] == 1 & pools$holiday[days] == 0) == 1) {
+    pools$sales[days] <- mean(pools$sales[days - 1], pools$sales[days + 1])
+  }
+}
+
+### We add a dummy for weekends and separate the months into standalone dummies.
+pools <- pools %>% mutate(wday = wday(date), weekend = ifelse(wday > 5, 1, 0))
+
+pools <- pools %>% mutate(month_1 = ifelse(month == 1, 1, 0),
+                 month_2 = ifelse(month == 2, 1, 0),
+                 month_3 = ifelse(month == 3, 1, 0),
+                 month_4 = ifelse(month == 4, 1, 0),
+                 month_5 = ifelse(month == 5, 1, 0),
+                 month_6 = ifelse(month == 6, 1, 0),
+                 month_7 = ifelse(month == 7, 1, 0),
+                 month_8 = ifelse(month == 8, 1, 0),
+                 month_9 = ifelse(month == 9, 1, 0),
+                 month_10 = ifelse(month == 10, 1, 0),
+                 month_11 = ifelse(month == 11, 1, 0))
+
+### We check the ACF/PACF chart to get a sense on the possible autoregressive / moving average features in the dataset. We do this here, because we intend to create variables linked back to earlier periods, which can be used in the tree based models.
+
+acf2(pools$sales)
+
+### Based on the ACF/PACF chart we decided to include sales one day, one week and one month before as additional variables, which we will us in the tree based models
+
+pools <- pools %>% mutate(t1_sales = lag(sales, n = 1),
+                  t7_sales = lag(sales, n = 7),
+                  t30_sales = lag(sales, n = 30))
+
+### Now we check how our final data looks. It seems that there is seasonality in the data, but no trend, so we decided to not use differences, but concentrate on levels when specifing the models.
+ggplot(data = pools, aes(x = date, y = sales)) + geom_line()
+
+write.csv(pools, "~/Documents/CEU/DA3/assig_3/pools_cleaned.csv", row.names = F)
+
+### Finally we separate the model into forecast and original sets, out of which the original set is used for modelling, and the forecast set will be used for the 60 days forecasting.
+pools_forecasts <- pools %>% filter(date > original_max)
+
+pools <- pools %>% filter(date <= original_max)
+```
+
+### Modelling the time series
+We start our modelling approach with basic models that only consider dummy variables on the month, weekend and holidays. We are using cross-validation during the modelling process, with equally long test samples, but different long train samples. We are trying to fit a model that is able to predict daily, and in order to do that we train and test the data on at least 365 days long periods (for simplicity we are ignoring quadrennials now, given that the total time period is only below 9 years). We base our model selection on the cross-validated RMSE value.
+
+```{r model setup, warning=F, error=F}
+### Creating the evaluation function
+RMSE <- function(pred, origin) { sqrt(mean((pred-origin)^2)) }
+
+### Cross-validation setup
+as.numeric(max(pools$date) - min(pools$date)) / 365 # We will make 7 folds in order to have full years only
+
+folds <- NULL
+for (i in 1:7){
+  f <- max(pools$date) - 365 * i
+  folds <- c(folds, f)
+}
+
+folds <- as.Date(folds)
+
+# the below function yields the RMSE values from all the folds for a selected model
+cv_modeller <- function(input_model){
+  set.seed(100)
+  RMSE_vector <- NULL
+  for (i in 1:length(folds)){
+    data_train <- pools %>% filter(date < folds[i])
+    data_test <- pools %>% filter(date >= folds[i] & date < folds[i] + 365)
+    model <- dynlm(formula(input_model) , data=data_train)
+    data_test$sales_pred <- predict(model, newdata = data_test)
+    RMSE_value <- RMSE(data_test$sales_pred, data_test$sales)
+    RMSE_vector <- c(RMSE_vector, RMSE_value)
+  }
+  return(RMSE_vector)
+}
+
+### We define four models with increasing complexity
+model0 <- "sales ~ 1"
+model1 <- "sales ~ month_1 + month_2 + month_3 + month_4 + month_5 + month_6 + month_7 + month_8 + month_9 + month_10 + month_11 + sales_flag"
+model2 <- "sales ~ month_1 + month_2 + month_3 + month_4 + month_5 + month_6 + month_7 + month_8 + month_9 + month_10 + month_11 + holiday + sales_flag"
+model3 <- "sales ~ month_1 + month_2 + month_3 + month_4 + month_5 + month_6 + month_7 + month_8 + month_9 + month_10 + month_11 + holiday + weekend + sales_flag"
+
+models <- list(model0, model1, model2, model3)
+
+model_results <- NULL
+
+### We run the models through our cross-validation process
+for (i in 1:length(models)){
+  model_res <- c("model_name" = paste0("model_",i), "mean_rmse" = mean(cv_modeller(models[[i]])))
+  model_results <- rbind(model_results, model_res)
+}
+
+model_results
+```
+
+The above table shos us that the model with the most variables provided the best mean RMSE value out of the four models.
+
+### ARIMA modelling
+We move on to the ARIMA models now. Based on the PACF / ACF plots visualised earlier, it seems that an AR1 model could be already very well fitting, but in order to be more precise, we are running several other models as well. Although R packages offer tools for automatic ARIMA model specification, but we would like to maintain more visibility with our approach on how the actual ARIMA models differ from each other in terms of performance. Based on what we discussed earlier, we don't see it necessary to difference in the models, thus the degree of differencing will be kept constant at 0. 
+
+```{r ARIMA, warning=F, error=F}
+# the below function yields the RMSE values from all the folds for a selected model
+cv_modeller_arima <- function(P, I, Q, varss){
+  set.seed(100)
+  RMSE_vector <- NULL
+  for (i in 1:length(folds)){
+    data_train <- pools %>% filter(date < folds[i])
+    
+    data_test <- pools %>% filter(date >= folds[i] & date < folds[i] + 365)
+    
+    Regressors <- data_train %>% select(one_of(varss))
+    
+    Regressors_test <- data_test %>% select(one_of(varss))
+    
+    model <- arima(data_train$sales, order = c(P, I, Q), xreg = Regressors, optim.control = list(maxit = 1000))
+
+    data_test$sales_pred <- predict(model, n.ahead = nrow(data_test), newxreg=Regressors_test)$pred
+
+    RMSE_value <- RMSE(data_test$sales_pred, data_test$sales)
+    
+    RMSE_vector <- c(RMSE_vector, RMSE_value)
+  }
+  return(RMSE_vector)
+}
+
+### We include all of the variables in our ARIMA models
+vars_arima <- c("month_1", "month_2", "month_3", "month_4", "month_5", "month_6", "month_7", 
+           "month_8", "month_9", "month_10", "month_11", "sales_flag", "holiday", "weekend")
+
+### We calculate 36 ARIMA models from 0,0,0 to 5,0,5
+for (i in 0:5){
+  for (y in 0:5){
+    model_res <- c("model_name" = paste0("arima_",i,0,y), "median_rmse" = mean(cv_modeller_arima(i, 0, y, vars_arima)))
+    model_results <- rbind(model_results, model_res)
+  }
+}
+
+model_results <- as.data.frame(model_results)
+model_results$mean_rmse <- as.double(as.character(model_results$mean_rmse))
+model_results$model_name <- as.character(model_results$model_name)
+head(model_results[order(model_results$mean_rmse),], 10)
+```
+
+The above table shows us the top 10 models based on mean RMSE on the cross-validated dataset. As expected, the ARIMA(0,0,0) model yielded the same results as the basic model with only the binary variables. It is more interesting that the best ARIMA model is the (0,0,1) model, or an MA1 model, however this is also somewhat inferior to the basic model with only the binary variables. The explanation can be that the month, weekend and holiday variables already capture the patterns in the data, and there is actually no further daily variation to be captured. Thinking back about the ACF and PACF charts they implied an AR1 model, but these charts did not include the impact of the seasonal binary variables, which can be the reason why the ARIMA (1,0,0) model is only the 10th best model in our estimation.
+
+### Predictions for 60 days
+As a next step we will visualise out predictions for the next 60 days (compared to the last data point of the original dataset). We will visualise both the best basic model, and the best non-zero ARIMA model, which is the ARIMA (0,0,1) model.
+
+```{r predictions, warning=F, error=F}
+model_results <- as.data.frame(model_results)
+model_results$mean_rmse <- as.double(as.character(model_results$mean_rmse))
+model_results$model_name <- as.character(model_results$model_name)
+head(model_results[order(model_results$mean_rmse),], 10)
+
+### Best basic model
+final_model <- dynlm(formula(model3) , data=pools)
+
+pools_forecasts$sales_pred_basic <- predict(final_model, newdata = pools_forecasts)
+
+
+### Best ARIMA
+Regressors <- pools %>% select(one_of(vars_arima))
+final_model <- arima(pools$sales, order = c(0, 0, 1), xreg = Regressors, optim.control = list(maxit = 1000))
+Regressors_fc <- pools_forecasts %>% select(one_of(vars_arima))
+
+pools_forecasts$sales_pred_arima <- predict(final_model, n.ahead = 60, newxreg=Regressors_fc)$pred
+
+### Visualizing forecasts
+final_pools <- pools %>% select(date, sales)
+
+final_pools <- final_pools %>% 
+  mutate(type = "original") %>% 
+  select(date, sales, type)
+
+final_preds_basic <- pools_forecasts %>% mutate(type = "basic", sales = sales_pred_basic) %>% select(date, sales, type) 
+
+final_preds_arima <- pools_forecasts %>% mutate(type = "arima", sales = sales_pred_arima) %>% select(date, sales, type) 
+
+final_preds <- rbind(final_pools, final_preds_basic, final_preds_arima)
+
+final_preds <- final_preds %>% filter(date > "2017-09-01")
+
+ggplot(data = final_preds, aes(x = date, y = sales, colour = type)) +
+  geom_line() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  ggtitle("60-days forecast of ticket sales")
+
+ggsave("~/Documents/CEU/github/swimming_pools/outputs/60_days_forecast_basic.png")
+
+```
+
+The above chart shows that the difference between the forecasts of the basic and the ARIMA (0,0,1) model are not very significant, although it's visible that they are not fully identical. 
+
+## PART B) - CART and random forest
+
+### CART model
+In the following we will estimate a CART model and later-on also a random forest model on the same dataset. For this we will use the original binary variables, but in order to capture the potential autoregression in sales, we also add the t-1, t-7 and t-30 sales values as variables to the data.
+
+```{r CART, warning=F, error=F}
+# the below function will be used for doing the forecasts with the tree based models, in order 
+caret_predicter <- function(model, forecast_data, periods){
+
+  for (i in 1:periods){
+
+    sales_pred_caret <- predict(model, newdata = forecast_data[i,])
+    forecast_data$sales[i] <- sales_pred_caret
+    
+    if (i < periods ){
+      forecast_data$t1_sales[i + 1] <- sales_pred_caret 
+    }
+    
+    if (i < periods - 6){
+      forecast_data$t7_sales[i + 7] <- sales_pred_caret 
+    }
+    
+    if (i < periods - 29){
+      forecast_data$t30_sales[i + 30] <- sales_pred_caret 
+    }
+
+  }
+  return(forecast_data)
+}
+
+myTimeControl <- trainControl(method = "timeslice",
+                              initialWindow = nrow(pools[is.na(pools$t30_sales) == F, ]) - 365,
+                              horizon = 365,
+                              fixedWindow = FALSE)
+
+vars_trees <- c("month_1", "month_2", "month_3", "month_4", "month_5", "month_6", "month_7", 
+           "month_8", "month_9", "month_10", "month_11", "sales_flag", "holiday", "weekend", 
+           "t1_sales", "t7_sales", "t30_sales")
+
+cart_name <- paste0("sales ~ ",paste(vars_trees,collapse = " + "))
+
+set.seed(42)
+cart_model <- train(formula(as.character(cart_name)),
+                    data = pools[is.na(pools$t30_sales) == F, ],
+                    method = "rpart",
+                    tuneLength = 50,
+                    trControl = myTimeControl)
+                    #tuneGrid = expand.grid(mincriterion=0.95))
+
+print(paste0("Best RMSE: ", cart_model$results$RMSE[cart_model$results$cp == cart_model$finalModel$tuneValue$cp]))
+
+fancyRpartPlot(cart_model$finalModel, sub = "")
+```
+
+The CART model already gives us much better fit with an RMSE of 69.22 vs. 106.86 at the best linear model (we note that the cross-validation of the caret package might not be fully identical, which could account for some of the decrease in the RMSE, although the folding method and the parameters are set closely to the same as in the previous calculations). It is also interesting that based on above plot, it seems that sales one day before and sales seven days before are the most prominent variables affecting current sales, while certain months are visible only on lower leafs.
+
+### Random forest model
+
+Moving to random forest, given that the dataset has not many observations and variables, thus it runs fairly quickly, we will include multiple paramaters for the selected amount of variables, in order to enhance the model we get.
+
+```{r random forest, warning=F, error=F}
+tune_grid <- expand.grid(
+  .mtry = 1:5,
+  .splitrule = "variance",
+  .min.node.size = 10
+)
+
+rf_name <- cart_name
+
+rf_model <- train(formula(as.character(rf_name)),
+                    data = pools[is.na(pools$t30_sales) == F, ],
+                    method = "ranger",
+                    tuneGrid = tune_grid,
+                    trControl = myTimeControl,
+                  importance = "impurity")
+
+rf_model
+
+plot(varImp(rf_model))
+
+temp_data <- caret_predicter(rf_model, pools_forecasts, 60)
+
+final_preds_rf <- temp_data %>% mutate(type = "random_forest", sales) %>% select(date, sales, type) 
+
+temp_data <- caret_predicter(cart_model, pools_forecasts, 60)
+
+final_preds_cart <- temp_data %>% mutate(type = "cart", sales) %>% select(date, sales, type) 
+
+final_preds <- rbind(final_preds, final_preds_rf, final_preds_cart)
+
+ggplot(data = final_preds, aes(x = date, y = sales, colour = type)) +
+  geom_line() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  ggtitle("60-days forecast of ticket sales")
+
+ggsave("~/Documents/CEU/github/swimming_pools/outputs/60_days_forecast_extended.png")
+
+```
+
+The model specifications shows as that the random forest model yielded actually the best results on the test set with an RMSE of 62.35. If we look at the variance importance plot, we can see that sales one day before and sales seven days before are the most important variables, followed by the June month dummy. This might seem counterintuitive compared to what we have seen when we compared the basic model and the ARIMA models, however one can argue that the autoregressive feature closely relates to the months, given that if e.g. today is in January, there is a high chance that yesterday was also in January, and as many of the months are similar in sales, only those which differ have more importance in the model. 
